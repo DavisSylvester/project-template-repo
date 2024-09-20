@@ -1,0 +1,236 @@
+version: 2.1
+
+parameters:
+  env:
+    type: string
+    default: dev
+  trunk_branch_name:
+    type: string
+    default: main
+  aws_account_id:
+    type: string
+  aws_region:
+    type: string
+    default: us-east-1
+  role_arn:
+    type: string
+  pipeline_role_arn:
+    type: string    
+  aws_api_gateway_id:
+    type: string
+  source_code_directory:
+    type: string
+    default: src
+  iac_directory:
+    type: string
+    default: infrastructure/iac/terraform
+    
+orbs:
+  aws-cli: circleci/aws-cli@4.1
+
+
+jobs:
+
+  common_setup:
+    executor: exec_common
+    parameters:
+      aws_account_id:
+        type: string
+      role_arn:
+        type: string
+    steps:
+      - checkout
+      - aws-cli/setup:
+          role_arn: << parameters.role_arn >>
+          region: us-east-1
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+  build:
+      executor: exec_sdk
+      parameters:
+
+      steps:
+        - attach_workspace:
+            at: .
+        - run:
+            name: dotnet build
+            command: |
+              
+              cd << parameters.source_code_directory >>
+
+              dotnet restore 
+              dotnet build -c Release
+              
+        - persist_to_workspace:
+            root: .
+            paths:
+              - .
+
+  unit_test:
+    executor: exec_sdk
+    parameters:      
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Unit tests
+          command: >
+            cd << parameters.source_code_directory >>;
+            
+            dotnet test
+
+  terraform_setup:
+      
+      executor: exec_terraform
+      
+      parameters:
+        env:
+          type: string
+        aws_account_id:
+          type: string
+        role_arn:
+          type: string
+      
+      steps:
+        - attach_workspace:
+            at: .
+
+        - aws-cli/setup:
+            role_arn: << parameters.role_arn >>
+            region: us-east-1
+
+        - run:
+            name: terraform init
+            command: |
+              cd << parameters.iac_directory >> ; terraform init -upgrade -backend-config=./envs/<< parameters.env >>/<< parameters.env >>.backend.tfvars
+
+        - persist_to_workspace:
+            root: .
+            paths:
+              - .
+
+  plan:
+    executor: exec_terraform
+    parameters:
+      env:
+        type: string
+      aws_account_id:
+        type: string
+      role_arn:
+        type: string  
+    steps:
+      - attach_workspace:
+          at: .
+      - aws-cli/setup:
+          role_arn: << parameters.role_arn >>
+          region: << parameters.aws_region >>
+      - run:
+          name: terraform plan
+          command: |
+            cd << parameters.iac_directory >> ; terraform plan -var-file="./envs/<< parameters.env >>/<< parameters.env >>.tfvars"
+
+
+  deploy:
+
+    executor: exec_terraform
+    
+    parameters:
+      env:
+        type: string
+      aws_account_id:
+        type: string
+      role_arn:
+        type: string  
+    
+    steps:
+      
+      - attach_workspace:
+          at: .
+      
+      - aws-cli/setup:
+          role_arn: << parameters.role_arn >>
+          region: << parameters.aws_region >>
+      
+      - run:
+          name: terraform apply
+          command: >
+            cd << parameters.iac_directory >> ;
+
+            terraform init -upgrade -backend-config=./envs/<< parameters.env >>/<< parameters.env >>.backend.tfvars;
+            terraform apply -var-file="./envs/<< parameters.env >>/<< parameters.env >>.tfvars" -auto-approve ;            
+
+      - run: |
+          cp $BASH_ENV bash.env
+      
+      - persist_to_workspace:
+          root: .
+          paths:
+            - bash.env
+
+
+  e2e:
+
+    executor: exec_node   
+   
+    steps:
+      - attach_workspace:
+          at: .
+
+      - run: |
+          echo "E2E to be implemented"
+
+  jira-notify:
+    
+    executor: node/default
+    
+    parameters:
+      env:
+        type: string
+        default: env
+    
+      env_type:
+        type: string
+        default: development
+    
+    steps:
+    
+      - checkout
+    
+      - jira/notify:
+          environment: << parameters.env >>
+          environment_type: << parameters.env_type >>
+          job_type: deployment
+          pipeline_id: << pipeline.id >>
+          pipeline_number: << pipeline.number >>
+          service_id: $$PROJECT_NAME$$
+
+  create_release:
+
+    executor: exec_common
+   
+    steps:
+      - attach_workspace:
+          at: .
+
+      - run:
+          name: Set Github Token
+          command: |
+            export GH_TOKEN=${GH_TOKEN}            
+           
+      - run:
+          name: Build Zip files
+          command: |
+            zip -r release.zip << parameters.source_code_directory >>/lambdas/$$PROJECT_NAME$$/bin/Release/net8.0/                                    
+
+      - run:
+          name: Create Release
+          command: |
+            echo "Creating Release"
+            export GH_TOKEN=${CAREMETX_CICD_TOKEN}
+            export RELEASE_NOTES=$(cat ./RELEASE_NOTES.md)
+            export RELEASE_VERSION=$(cat ./VERSION)
+            gh release create v"${RELEASE_VERSION}.${CIRCLE_BUILD_NUM}" --notes "${RELEASE_NOTES}" --title "Release v${RELEASE_VERSION}.${CIRCLE_BUILD_NUM}" release.zip
+
